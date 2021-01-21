@@ -4,6 +4,8 @@ using System.Linq;
 using System.Numerics;
 using System.Threading.Tasks;
 using SudokuBlazor.Models;
+using SudokuBlazor.Solver;
+using SudokuBlazor.Solver.Constraints;
 
 namespace SudokuBlazor.Shared
 {
@@ -20,16 +22,53 @@ namespace SudokuBlazor.Shared
         private const string conflictedColor = "#ee0000";
 
         // State
-        private readonly Dictionary<(int, int, int), Text> cellText = new Dictionary<(int, int, int), Text>();
+        enum ValueType
+        {
+            Filled,
+            Corner,
+            Center
+        }
+        private readonly Dictionary<(int, ValueType, int), Text> cellText = new Dictionary<(int, ValueType, int), Text>();
         private readonly bool[] cellIsGiven = new bool[81];
         private readonly int[] cellValues = new int[81];
         private readonly uint[] cellCenterMarks = new uint[81];
         private readonly uint[] cellCornerMarks = new uint[81];
+        private readonly Dictionary<int, Constraint> constraints = new();
+        public string[] ConstraintStrings => constraints.Values.Select(c => c.Serialized).ToArray();
 
         // Tables
         private readonly (double, double)[] cornerMarkOffsets = new (double, double)[9];
 
-        public int[] CellValues => (int[])cellValues.Clone();
+        public int[] GetCellValues(bool respectFilledMarks)
+        {
+            if (respectFilledMarks)
+            {
+                return (int[])cellValues.Clone();
+            }
+
+            int[] result = new int[81];
+            for (int i = 0; i < 81; i++)
+            {
+                result[i] = cellIsGiven[i] ? cellValues[i] : 0;
+            }
+            return result;
+        }
+        public uint[] GetCellCandidates(bool respectFilledMarks, bool respectCenterMarks)
+        {
+            uint[] cellCandidates = new uint[81];
+            for (int i = 0; i < 81; i++)
+            {
+                if (cellValues[i] != 0)
+                {
+                    cellCandidates[i] = respectFilledMarks || cellIsGiven[i] ? SolverUtility.ValueMask(cellValues[i]) | SolverUtility.valueSetMask : SolverUtility.ALL_VALUES_MASK;
+                }
+                else
+                {
+                    cellCandidates[i] = (!respectCenterMarks || cellCenterMarks[i] == 0) ? SolverUtility.ALL_VALUES_MASK : cellCenterMarks[i];
+                }
+            }
+            return cellCandidates;
+        }
 
         protected override void OnInitialized()
         {
@@ -51,12 +90,13 @@ namespace SudokuBlazor.Shared
             cornerMarkOffsets[8] = (offsetX2, offsetY1);
         }
 
-        private record Snapshot(int[] CellValues, uint[] CellCornerMarks, uint[] CellCenterMarks);
+        private record Snapshot(int[] CellValues, bool[] CellIsGiven, uint[] CellCornerMarks, uint[] CellCenterMarks);
 
         public object TakeSnapshot()
         {
             return new Snapshot(
                 (int[])cellValues.Clone(),
+                (bool[])cellIsGiven.Clone(),
                 (uint[])cellCornerMarks.Clone(),
                 (uint[])cellCenterMarks.Clone()
             );
@@ -68,9 +108,9 @@ namespace SudokuBlazor.Shared
             {
                 for (int cellIndex = 0; cellIndex < 81; cellIndex++)
                 {
-                    if (cellValues[cellIndex] != snapshot.CellValues[cellIndex])
+                    if (cellValues[cellIndex] != snapshot.CellValues[cellIndex] || cellIsGiven[cellIndex] != snapshot.CellIsGiven[cellIndex])
                     {
-                        SetCellValue(cellIndex, snapshot.CellValues[cellIndex]);
+                        SetCellValue(cellIndex, snapshot.CellValues[cellIndex], snapshot.CellIsGiven[cellIndex], true);
                         SetDirty();
                     }
 
@@ -83,7 +123,7 @@ namespace SudokuBlazor.Shared
                         {
                             for (int value = 1; value <= 9; value++)
                             {
-                                cellText.Remove((cellIndex, 1, value));
+                                cellText.Remove((cellIndex, ValueType.Corner, value));
                             }
 
                             ReRenderCornerMarks(cellIndex);
@@ -100,7 +140,7 @@ namespace SudokuBlazor.Shared
                         {
                             for (int value = 1; value <= 9; value++)
                             {
-                                cellText.Remove((cellIndex, 2, value));
+                                cellText.Remove((cellIndex, ValueType.Center, value));
                             }
 
                             ReRenderCenterMarks(cellIndex);
@@ -117,7 +157,10 @@ namespace SudokuBlazor.Shared
             {
                 return;
             }
-            ClearCell(cellIndex, fullClear: true);
+            ClearCell(
+                cellIndex: cellIndex,
+                fullClear: true,
+                clearGivens: true);
 
             cellIsGiven[cellIndex] = true;
             cellValues[cellIndex] = value;
@@ -126,14 +169,36 @@ namespace SudokuBlazor.Shared
             CheckConflicts();
         }
 
-        public bool SetCellValue(int cellIndex, int value)
+        public bool SetCellValue(int cellIndex, int value, bool given, bool force = false)
         {
             if (value < 1 || value > 9)
             {
-                return ClearCell(cellIndex);
+                return ClearCell(
+                    cellIndex: cellIndex,
+                    fullClear: false,
+                    clearGivens: given || force);
             }
 
-            if (cellIsGiven[cellIndex] || cellValues[cellIndex] == value)
+            if (cellValues[cellIndex] == value)
+            {
+                if (given && !cellIsGiven[cellIndex])
+                {
+                    cellIsGiven[cellIndex] = true;
+                    cellText[(cellIndex, 0, 0)] = CreateFilledText(cellIndex, value, givenColor);
+                    SetDirty();
+                    return true;
+                }
+                else if (force && !given && cellIsGiven[cellIndex])
+                {
+                    cellIsGiven[cellIndex] = false;
+                    cellText[(cellIndex, 0, 0)] = CreateFilledText(cellIndex, value, filledColor);
+                    SetDirty();
+                    return true;
+                }
+                return false;
+            }
+
+            if (!force && !given && cellIsGiven[cellIndex])
             {
                 return false;
             }
@@ -144,10 +209,46 @@ namespace SudokuBlazor.Shared
             }
 
             cellValues[cellIndex] = value;
-            cellText[(cellIndex, 0, 0)] = CreateFilledText(cellIndex, value, filledColor);
+            cellIsGiven[cellIndex] = given;
+            cellText[(cellIndex, 0, 0)] = CreateFilledText(cellIndex, value, given ? givenColor : filledColor);
             SetDirty();
             CheckConflicts();
             return true;
+        }
+
+        public bool SetAllCellValues(int[] newCellValues)
+        {
+            bool changed = false;
+            for (int cellIndex = 0; cellIndex < cellValues.Length; cellIndex++)
+            {
+                int newValue = newCellValues[cellIndex];
+                if (cellIsGiven[cellIndex] || cellValues[cellIndex] == newValue)
+                {
+                    continue;
+                }
+
+                if (newValue == 0)
+                {
+                    cellText.Remove((cellIndex, 0, 0));
+                    cellValues[cellIndex] = 0;
+                    ReRenderCenterMarks(cellIndex);
+                    ReRenderCornerMarks(cellIndex);
+                }
+                else
+                {
+                    ClearPencilmarkVisuals(cellIndex);
+                    cellValues[cellIndex] = newValue;
+                    cellText[(cellIndex, 0, 0)] = CreateFilledText(cellIndex, newValue, filledColor);
+                }
+                changed = true;
+            }
+
+            if (changed)
+            {
+                SetDirty();
+                CheckConflicts();
+            }
+            return changed;
         }
 
         private static Text CreateFilledText(int cellIndex, int value, string color) => new Text(
@@ -159,32 +260,157 @@ namespace SudokuBlazor.Shared
             text: value.ToString()
         );
 
-        public bool ToggleCornerMark(int cellIndex, int value)
+        private bool ToggleMarks(IEnumerable<int> cellIndexes, int value, ValueType type)
         {
+            bool dirty = false;
+
+            // An invalid value mean to clear the cell instead.
             if (value < 1 || value > 9)
             {
-                return ClearCell(cellIndex);
+                foreach (int cellIndex in cellIndexes)
+                {
+                    dirty = ClearCell(
+                        cellIndex: cellIndex,
+                        fullClear: false,
+                        clearGivens: false);
+                }
+                return dirty;
             }
 
-            if (cellIsGiven[cellIndex] || cellValues[cellIndex] != 0)
+            // Only care about cells which aren't given and have no value filled.
+            List<int> cellIndexList = cellIndexes.Where(i => !cellIsGiven[i] && cellValues[i] == 0).ToList();
+            if (cellIndexList.Count == 0)
             {
                 return false;
             }
 
             uint valueMask = 1u << (value - 1);
-            if ((cellCornerMarks[cellIndex] & valueMask) != 0)
+            uint[] cellMarks = type == ValueType.Corner ? cellCornerMarks : cellCenterMarks;
+
+            // Determine if the selection is a mix between filled and unfilled cells
+            bool haveFilledCell = false;
+            bool haveUnfilledCell = false;
+            foreach (int cellIndex in cellIndexList)
             {
-                cellCornerMarks[cellIndex] &= ~valueMask;
-                cellText.Remove((cellIndex, 1, value));
-            }
-            else
-            {
-                cellCornerMarks[cellIndex] |= valueMask;
+                if ((cellMarks[cellIndex] & valueMask) == 0)
+                {
+                    haveUnfilledCell = true;
+                }
+                else
+                {
+                    haveFilledCell = true;
+                }
             }
 
-            ReRenderCornerMarks(cellIndex);
-            SetDirty();
-            return true;
+            if (haveUnfilledCell)
+            {
+                // If any unfilled cells exist, then the prefence is to filled just those cells
+                foreach (int cellIndex in cellIndexList)
+                {
+                    if ((cellMarks[cellIndex] & valueMask) == 0)
+                    {
+                        cellMarks[cellIndex] |= valueMask;
+                        if (type == ValueType.Corner)
+                        {
+                            ReRenderCornerMarks(cellIndex);
+                        }
+                        else
+                        {
+                            ReRenderCenterMarks(cellIndex);
+                        }
+                        dirty = true;
+                    }
+                }
+            }
+            else if (haveFilledCell)
+            {
+                // Otherwise, clear all cells
+                foreach (int cellIndex in cellIndexList)
+                {
+                    cellMarks[cellIndex] &= ~valueMask;
+                    cellText.Remove((cellIndex, type, value));
+                    if (type == ValueType.Corner)
+                    {
+                        ReRenderCornerMarks(cellIndex);
+                    }
+                    else
+                    {
+                        ReRenderCenterMarks(cellIndex);
+                    }
+                }
+                dirty = true;
+            }
+
+            if (dirty)
+            {
+                SetDirty();
+            }
+            return dirty;
+        }
+
+        public enum SingleValueBehavior
+        {
+            AlwaysKeepAsPencilmark,
+            RespectValueSetBit,
+            SingleValueAlwaysSetAsValue
+        }
+        public bool SetAllCenterPencilMarks(uint[] candidates, SingleValueBehavior singleValueBehavior = SingleValueBehavior.AlwaysKeepAsPencilmark)
+        {
+            bool changed = false;
+            for (int cellIndex = 0; cellIndex < cellValues.Length; cellIndex++)
+            {
+                uint curCandidates = cellCenterMarks[cellIndex];
+                uint newCandidates = candidates[cellIndex];
+                if (cellIsGiven[cellIndex] || cellValues[cellIndex] != 0)
+                {
+                    continue;
+                }
+
+                if (singleValueBehavior == SingleValueBehavior.RespectValueSetBit && SolverUtility.IsValueSet(candidates[cellIndex]) ||
+                    singleValueBehavior == SingleValueBehavior.SingleValueAlwaysSetAsValue && SolverUtility.ValueCount(newCandidates) == 1)
+                {
+                    int newValue = SolverUtility.GetValue(newCandidates);
+                    ClearPencilmarkVisuals(cellIndex);
+                    cellValues[cellIndex] = newValue;
+                    cellText[(cellIndex, 0, 0)] = CreateFilledText(cellIndex, newValue, filledColor);
+                    changed = true;
+                    continue;
+                }
+
+                bool centerMarksChanged = false;
+                for (int value = 1; value <= 9; value++)
+                {
+                    uint valueMask = SolverUtility.ValueMask(value);
+                    bool curHaveValue = (curCandidates & valueMask) != 0;
+                    bool newHaveValue = (newCandidates & valueMask) != 0;
+                    if (curHaveValue != newHaveValue)
+                    {
+                        if (curHaveValue)
+                        {
+                            cellText.Remove((cellIndex, ValueType.Center, value));
+                        }
+                        centerMarksChanged = true;
+                    }
+                }
+
+                if (centerMarksChanged)
+                {
+                    cellCenterMarks[cellIndex] = newCandidates & ~SolverUtility.valueSetMask;
+                    ReRenderCenterMarks(cellIndex);
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                SetDirty();
+            }
+            return changed;
+        }
+
+        public bool ToggleCornerMarks(IEnumerable<int> cellIndexes, int value)
+        {
+            return ToggleMarks(cellIndexes, value, ValueType.Corner);
         }
 
         protected void ReRenderCornerMarks(int cellIndex)
@@ -208,7 +434,7 @@ namespace SudokuBlazor.Shared
                 double cellStartY = (cellIndex / 9) * cellRectWidth;
                 var (offsetX, offsetY) = cornerMarkOffsets[cornerIndex];
 
-                cellText[(cellIndex, 1, value)] = new Text(
+                cellText[(cellIndex, ValueType.Corner, value)] = new Text(
                     x: cellStartX + offsetX,
                     y: cellStartY + offsetY,
                     fontSize: markupFontSize,
@@ -220,32 +446,9 @@ namespace SudokuBlazor.Shared
             }
         }
 
-        public bool ToggleCenterMark(int cellIndex, int value)
+        public bool ToggleCenterMarks(IEnumerable<int> cellIndexes, int value)
         {
-            if (value < 1 || value > 9)
-            {
-                return ClearCell(cellIndex);
-            }
-
-            if (cellIsGiven[cellIndex] || cellValues[cellIndex] != 0)
-            {
-                return false;
-            }
-
-            uint valueMask = 1u << (value - 1);
-            if ((cellCenterMarks[cellIndex] & valueMask) != 0)
-            {
-                cellCenterMarks[cellIndex] &= ~valueMask;
-                cellText.Remove((cellIndex, 2, value));
-            }
-            else
-            {
-                cellCenterMarks[cellIndex] |= valueMask;
-            }
-
-            ReRenderCenterMarks(cellIndex);
-            SetDirty();
-            return true;
+            return ToggleMarks(cellIndexes, value, ValueType.Center);
         }
 
         protected void ReRenderCenterMarks(int cellIndex)
@@ -272,7 +475,7 @@ namespace SudokuBlazor.Shared
                 double cellStartY = (cellIndex / 9) * cellRectWidth + cellRectWidth / 2.0;
                 double offsetX = (-0.5 * numCenterMarks + valueIndex + 0.5) * fontSize * fontWidthHeightRatio;
 
-                cellText[(cellIndex, 2, value)] = new Text(
+                cellText[(cellIndex, ValueType.Center, value)] = new Text(
                     x: cellStartX + offsetX,
                     y: cellStartY,
                     fontSize: fontSize,
@@ -284,9 +487,9 @@ namespace SudokuBlazor.Shared
             }
         }
 
-        public bool ClearCell(int cellIndex, bool fullClear = false)
+        public bool ClearCell(int cellIndex, bool fullClear, bool clearGivens)
         {
-            if (cellIsGiven[cellIndex])
+            if (!clearGivens && cellIsGiven[cellIndex])
             {
                 return false;
             }
@@ -295,6 +498,7 @@ namespace SudokuBlazor.Shared
             {
                 cellText.Remove((cellIndex, 0, 0));
                 cellValues[cellIndex] = 0;
+                cellIsGiven[cellIndex] = false;
                 SetDirty();
                 CheckConflicts();
                 ReRenderCenterMarks(cellIndex);
@@ -310,7 +514,7 @@ namespace SudokuBlazor.Shared
             {
                 for (int v = 1; v <= 9; v++)
                 {
-                    cellText.Remove((cellIndex, 1, v));
+                    cellText.Remove((cellIndex, ValueType.Corner, v));
                 }
                 cellCornerMarks[cellIndex] = 0;
                 SetDirty();
@@ -321,7 +525,7 @@ namespace SudokuBlazor.Shared
             {
                 for (int v = 1; v <= 9; v++)
                 {
-                    cellText.Remove((cellIndex, 2, v));
+                    cellText.Remove((cellIndex, ValueType.Center, v));
                 }
                 cellCenterMarks[cellIndex] = 0;
                 SetDirty();
@@ -337,7 +541,7 @@ namespace SudokuBlazor.Shared
             {
                 for (int v = 1; v <= 9; v++)
                 {
-                    if (cellText.Remove((cellIndex, 1, v)))
+                    if (cellText.Remove((cellIndex, ValueType.Corner, v)))
                     {
                         SetDirty();
                     }
@@ -348,12 +552,22 @@ namespace SudokuBlazor.Shared
             {
                 for (int v = 1; v <= 9; v++)
                 {
-                    if (cellText.Remove((cellIndex, 2, v)))
+                    if (cellText.Remove((cellIndex, ValueType.Center, v)))
                     {
                         SetDirty();
                     }
                 }
             }
+        }
+
+        public bool ResetToGivens()
+        {
+            bool changed = false;
+            for (int i = 0; i < 81; i++)
+            {
+                changed |= ClearCell(i, true, false);
+            }
+            return changed;
         }
 
         public int GetCellValue(int cellIndex)
@@ -458,6 +672,37 @@ namespace SudokuBlazor.Shared
                 }
             }
 
+            foreach (var constraint in constraints.Values)
+            {
+                var group = constraint.Group;
+                if (group != null)
+                {
+                    Array.Clear(digitCount, 0, 9);
+                    foreach (var cell in constraint.Group)
+                    {
+                        int cellIndex = SolverUtility.FlatIndex(cell);
+                        int curValue = cellValues[cellIndex];
+                        if (curValue > 0)
+                        {
+                            digitCount[curValue - 1]++;
+                        }
+                    }
+                    foreach (var cell in constraint.Group)
+                    {
+                        int cellIndex = SolverUtility.FlatIndex(cell);
+                        int curValue = cellValues[cellIndex];
+                        if (curValue > 0)
+                        {
+                            if (digitCount[curValue - 1] > 1)
+                            {
+                                cellIsConflicted[cellIndex] = true;
+                            }
+                        }
+                    }
+                }
+                constraint.MarkConflicts(cellValues, cellIsConflicted);
+            }
+
             for (int i = 0; i < 81; i++)
             {
                 if (cellValues[i] != 0)
@@ -476,6 +721,18 @@ namespace SudokuBlazor.Shared
                 cellText[(cellIndex, 0, 0)] = CreateFilledText(cellIndex, cellValues[cellIndex], desiredColor);
                 SetDirty();
             }
+        }
+
+        public void AddConstraint(int id, Constraint constraint)
+        {
+            constraints[id] = constraint;
+            CheckConflicts();
+        }
+
+        public void RemoveConstraint(int id)
+        {
+            constraints.Remove(id);
+            CheckConflicts();
         }
     }
 }
